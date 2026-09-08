@@ -72,8 +72,8 @@ ORDER BY actual_chunks DESC, f.project_id, f.name, f.id;
 
 \echo '=== 5. 未关联现存文件的分块来源（可能包含记忆等非文件数据） ==='
 -- 单独列出，避免将非文件知识记录遗漏，也不直接判定其为异常。
-SELECT k.project_id,
-       k.file_id,
+-- 内网旧基线的分块表没有 project_id，非文件来源不推断所属项目。
+SELECT k.file_id,
        k.source_name,
        k.content_type,
        COUNT(*) AS actual_chunks,
@@ -81,8 +81,8 @@ SELECT k.project_id,
 FROM knowledge_embeddings k
 LEFT JOIN files f ON f.id = k.file_id
 WHERE f.id IS NULL
-GROUP BY k.project_id, k.file_id, k.source_name, k.content_type
-ORDER BY actual_chunks DESC, k.project_id, k.source_name;
+GROUP BY k.file_id, k.source_name, k.content_type
+ORDER BY actual_chunks DESC, k.file_id, k.source_name;
 
 COMMIT;
 \echo '=== 知识库只读盘点完成 ==='
