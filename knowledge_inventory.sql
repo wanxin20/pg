@@ -1,9 +1,11 @@
--- 知识库只读盘点：上传文件数量、实际分块数量、各文件索引明细。
+-- 知识库只读盘点：上传文件数量、实际分块数量、各文件索引明细和正文抽样。
 -- 用法（内网服务器）：
 -- psql -X -h /tmp -p 5433 -U haier_user -d haier_db -W -v ON_ERROR_STOP=1 -f "$HOME/pg/knowledge_inventory.sql"
 -- 仅查询当前连接的数据库；不是升级脚本，不修改业务数据，不触发索引。
 -- 全库管理员口径，不应用客户端的项目/个人文件可见性过滤。
 -- 分块存在或有向量，不代表已通过应用层权限、质量和检索范围过滤。
+-- 第 6 项每个现存文件抽取前 3 块，每块最多 1000 字符，不是全文导出。
+-- 输出包含内部正文，请保存在受控位置，不要提交到公开 Git 仓库。
 \set ON_ERROR_STOP on
 \encoding UTF8
 \pset pager off
@@ -83,6 +85,39 @@ LEFT JOIN files f ON f.id = k.file_id
 WHERE f.id IS NULL
 GROUP BY k.file_id, k.source_name, k.content_type
 ORDER BY actual_chunks DESC, k.file_id, k.source_name;
+
+\echo '=== 6. 文件正文抽样（每文件前 3 块，每块最多 1000 字符） ==='
+-- 使用纵向显示避免长正文撑宽整张表；以真实文件关联项目，不依赖分块表 project_id。
+-- chunk_index 可能重复，用主键排序保证抽样稳定；没有分块的文件见第 4 项。
+\pset expanded on
+WITH ranked_chunks AS (
+    SELECT id,
+           file_id,
+           chunk_index,
+           ROW_NUMBER() OVER (
+               PARTITION BY file_id ORDER BY chunk_index NULLS LAST, id
+           ) AS sample_rank
+    FROM knowledge_embeddings
+    WHERE file_id IS NOT NULL
+)
+SELECT p.name AS project_name,
+       f.project_id,
+       f.id AS file_id,
+       f.name AS file_name,
+       k.id AS chunk_id,
+       k.chunk_index,
+       k.content_type,
+       k.embedding IS NOT NULL AS has_vector,
+       CHAR_LENGTH(k.chunk_text) AS full_text_chars,
+       COALESCE(CHAR_LENGTH(k.chunk_text), 0) > 1000 AS text_truncated,
+       LEFT(k.chunk_text, 1000) AS text_sample
+FROM ranked_chunks r
+JOIN knowledge_embeddings k ON k.id = r.id
+JOIN files f ON f.id = r.file_id
+LEFT JOIN projects p ON p.id = f.project_id
+WHERE r.sample_rank <= 3
+ORDER BY f.project_id, f.name, f.id, r.sample_rank;
+\pset expanded off
 
 COMMIT;
 \echo '=== 知识库只读盘点完成 ==='
