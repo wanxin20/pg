@@ -9,6 +9,66 @@ const migration = readFileSync(new URL('../server_upgrade_074_to_075.sql', impor
   .replace(/^\\set ON_ERROR_STOP on\r?\n/, '');
 const secondAdminMigration = readFileSync(new URL('../server_upgrade_075_to_076.sql', import.meta.url), 'utf8')
   .replace(/^\\set ON_ERROR_STOP on\r?\n/, '');
+const combinedMigration = readFileSync(new URL('../server_upgrade_074_to_076.sql', import.meta.url), 'utf8')
+  .replace(/^\\set ON_ERROR_STOP on\r?\n/, '');
+
+test('合并文件保留两个已发布脚本的事务内容，且只有一次提交', () => {
+  for (const sql of [migration, secondAdminMigration]) {
+    const body = sql.replace(/\r\n/g, '\n').split('BEGIN;\n')[1].split('\nCOMMIT;')[0].trim();
+    assert.ok(combinedMigration.replace(/\r\n/g, '\n').includes(body));
+  }
+  assert.equal((combinedMigration.match(/^BEGIN;/gm) || []).length, 1);
+  assert.equal((combinedMigration.match(/^COMMIT;/gm) || []).length, 1);
+});
+
+for (const initialVersion of [74, 75, 76]) {
+  test(`从 ${initialVersion} 执行合并脚本：两位管理员生效，历史关联保留且重跑无变化`, async () => {
+    const db = await secondAdminFixture(initialVersion >= 75);
+    try {
+      if (initialVersion === 76) await db.exec(secondAdminMigration);
+      const before = await snapshot(db);
+      await db.exec(combinedMigration);
+      const after = await snapshot(db);
+      assert.deepEqual(after.projects, before.projects);
+      assert.deepEqual(after.users.map((row) => row.id), before.users.map((row) => row.id));
+      assert.deepEqual(after.audit.find((row) => row.action === 'HISTORICAL_EVENT'), before.audit.find((row) => row.action === 'HISTORICAL_EVENT'));
+      for (const username of ['01069355', 'A1016659']) {
+        const target = after.users.find((row) => row.username === username);
+        assert.equal(target.role, 'super_admin');
+        assert.equal(target.status, 'active');
+        assert.equal(target.auth_source, 'iama');
+        assert.equal(target.token_version, 1);
+      }
+      for (const row of after.users.filter((row) => row.auth_source === 'local' && row.role !== 'system')) {
+        assert.equal(row.status, 'disabled');
+        assert.equal(row.password_hash, '');
+        assert.equal(row.role, 'user');
+      }
+      assert.equal(after.audit.filter((row) => row.action === 'SSO_ADMIN_PROMOTED').length, 2);
+      await db.exec(combinedMigration);
+      assert.deepEqual(await snapshot(db), after);
+      if (initialVersion === 76) assert.deepEqual(after, before);
+    } finally { await db.close(); }
+  });
+}
+
+for (const [name, change] of [
+  ['第一位身份不符', "UPDATE users SET auth_source='local' WHERE username='01069355'"],
+  ['第二位身份不符', "UPDATE users SET email='wrong@example.invalid' WHERE username='A1016659'"],
+  ['第二位不存在', "DELETE FROM users WHERE username='A1016659'"],
+  ['第二位提权审计失败', "ALTER TABLE audit_logs ADD CONSTRAINT fail_combined CHECK (detail->>'migration' <> '076')"],
+]) {
+  test(`合并执行时${name}：全部回滚，旧本地管理员保持原样`, async () => {
+    const db = await secondAdminFixture(false);
+    try {
+      await db.exec(change);
+      const before = await snapshot(db);
+      await assert.rejects(db.exec(combinedMigration));
+      await db.exec('ROLLBACK');
+      assert.deepEqual(await snapshot(db), before);
+    } finally { await db.close(); }
+  });
+}
 
 async function fixture() {
   const db = new PGlite();
@@ -111,10 +171,10 @@ test('中途审计写入失败时，已执行的提权及停用一起回滚', as
   } finally { await db.close(); }
 });
 
-/** 075 后已有一个可用超级管理员，第二个账号保持实际截图中的管理员身份。 */
-async function secondAdminFixture() {
+/** 可选择是否已执行 075；第二个账号保持实际截图中的管理员身份。 */
+async function secondAdminFixture(apply075 = true) {
   const db = await fixture();
-  await db.exec(migration);
+  if (apply075) await db.exec(migration);
   await db.exec(`INSERT INTO users (username,email,auth_source,role,iama_user_id,must_change_password)
     VALUES ('A1016659','A1016659@haier.com','iama','admin','iama-second',false)`);
   return db;
