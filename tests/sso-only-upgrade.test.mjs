@@ -7,6 +7,8 @@ import { PGlite } from '@electric-sql/pglite';
 // 仅剥离 psql 的客户端指令，所有数据库 SQL 原样执行。
 const migration = readFileSync(new URL('../server_upgrade_074_to_075.sql', import.meta.url), 'utf8')
   .replace(/^\\set ON_ERROR_STOP on\r?\n/, '');
+const secondAdminMigration = readFileSync(new URL('../server_upgrade_075_to_076.sql', import.meta.url), 'utf8')
+  .replace(/^\\set ON_ERROR_STOP on\r?\n/, '');
 
 async function fixture() {
   const db = new PGlite();
@@ -108,3 +110,56 @@ test('中途审计写入失败时，已执行的提权及停用一起回滚', as
     assert.deepEqual(await snapshot(db), before);
   } finally { await db.close(); }
 });
+
+/** 075 后已有一个可用超级管理员，第二个账号保持实际截图中的管理员身份。 */
+async function secondAdminFixture() {
+  const db = await fixture();
+  await db.exec(migration);
+  await db.exec(`INSERT INTO users (username,email,auth_source,role,iama_user_id,must_change_password)
+    VALUES ('A1016659','A1016659@haier.com','iama','admin','iama-second',false)`);
+  return db;
+}
+
+test('076 增加第二位超级管理员，保留第一位及其他数据，撤销目标旧会话且可重跑', async () => {
+  const db = await secondAdminFixture();
+  try {
+    const before = await snapshot(db);
+    await db.exec(secondAdminMigration);
+    const after = await snapshot(db);
+    const target = after.users.find((row) => row.username === 'A1016659');
+    const previous = before.users.find((row) => row.username === 'A1016659');
+    assert.equal(target.id, previous.id);
+    assert.equal(target.role, 'super_admin');
+    assert.equal(target.status, 'active');
+    assert.equal(target.token_version, previous.token_version + 1);
+    assert.equal(after.users.filter((row) => row.role === 'super_admin' && row.status === 'active').length, 2);
+    assert.deepEqual(after.users.filter((row) => row.id !== target.id), before.users.filter((row) => row.id !== target.id));
+    assert.deepEqual(after.projects, before.projects);
+    assert.deepEqual(after.audit.filter((row) => row.detail?.migration !== '076'), before.audit);
+    assert.equal(after.audit.filter((row) => row.detail?.migration === '076').length, 1);
+    await db.exec(secondAdminMigration);
+    assert.deepEqual(await snapshot(db), after);
+  } finally { await db.close(); }
+});
+
+for (const [name, change] of [
+  ['第一位管理员未就绪', "UPDATE users SET role='admin' WHERE username='01069355'"],
+  ['第二位用户不存在', "DELETE FROM users WHERE username='A1016659'"],
+  ['第二位邮箱不匹配', "UPDATE users SET email='wrong@example.invalid' WHERE username='A1016659'"],
+  ['第二位不是 SSO', "UPDATE users SET auth_source='local' WHERE username='A1016659'"],
+  ['第二位已停用', "UPDATE users SET status='disabled' WHERE username='A1016659'"],
+  ['第二位绑定为空', "UPDATE users SET iama_user_id=' ' WHERE username='A1016659'"],
+  ['第二位为系统占位账号', "UPDATE users SET role='system' WHERE username='A1016659'"],
+  ['审计写入失败', "ALTER TABLE audit_logs ADD CONSTRAINT fail_second_admin CHECK (detail->>'migration' <> '076')"],
+]) {
+  test(`076 ${name}时回滚，第一位管理员及全部历史数据不变`, async () => {
+    const db = await secondAdminFixture();
+    try {
+      await db.exec(change);
+      const before = await snapshot(db);
+      await assert.rejects(db.exec(secondAdminMigration));
+      await db.exec('ROLLBACK');
+      assert.deepEqual(await snapshot(db), before);
+    } finally { await db.close(); }
+  });
+}
