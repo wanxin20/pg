@@ -1,9 +1,10 @@
 -- server_upgrade_071_to_074.sql —— GOS 服务端 071 → 074 原子增量迁移。
--- 适用：目标库已完成 066 → 071；按顺序补齐诊断字段、并发默认值及本地密码策略。
+-- 适用：目标库已完成 066 → 071；仅补齐 072 诊断字段及 074 本地密码策略。
+-- 按部署要求跳过 073；本脚本不读取或修改子任务并发配置。
 -- 原始迁移来自应用仓库提交 5f2993bb；下方 SOURCE 段保持原文。
 -- 执行前停止 GOS Server 与相关写入进程，并使用 pg_dump -Fc 备份实际业务库。
 -- 使用 psql -v ON_ERROR_STOP=1 -f server_upgrade_071_to_074.sql 整体执行。
--- 已执行部分 072–074 的库可重跑；不更改现有密码哈希，不停用账号。
+-- 已执行 072 或 074 的库可重跑；不更改现有密码哈希，不停用账号。
 -- 升级后旧本地账号可能需要改密，闲置停用由应用策略执行；SSO 密码仍由上游管理。
 
 \set ON_ERROR_STOP on
@@ -17,7 +18,6 @@ BEGIN
     IF to_regclass('public.users') IS NULL
        OR to_regclass('public.audit_logs') IS NULL
        OR to_regclass('public.agent_diagnostics') IS NULL
-       OR to_regclass('public.system_config') IS NULL
        OR to_regclass('public.due_diligence_cases') IS NULL
        OR to_regclass('public.due_diligence_events') IS NULL
     THEN
@@ -35,36 +35,6 @@ CREATE INDEX IF NOT EXISTS ix_agent_diagnostics_request_id ON agent_diagnostics(
 CREATE INDEX IF NOT EXISTS ix_agent_diagnostics_created_at ON agent_diagnostics(created_at);
 -- 验证：SELECT request_id, build, context FROM agent_diagnostics LIMIT 1;
 -- ===== END SOURCE 072_diagnostic_context.sql =====
-
--- ===== BEGIN SOURCE 073_subagent_concurrency_default_five.sql =====
--- 073：后台默认直接子任务并发由2调整为5，与本机策略上限保持一致。
--- 这是已有配置的数据更新，不修改已发布的066/067迁移；保留其他管理员自定义值、
--- max_output_tokens及其余字段。重复执行只跳过已完成的更新。
-
-INSERT INTO system_config (id, key, value, description, category)
-VALUES (
-    gen_random_uuid(),
-    'agent_runtime',
-    '{"max_concurrent_subagents": 5, "max_output_tokens": null}'::jsonb,
-    '智能体运行参数：子智能体期望并发默认5（1-64），实际值受本机策略上限约束；最大输出 Token 留空时使用客户端默认值8192',
-    'client'
-)
-ON CONFLICT (key) DO UPDATE
-SET value = jsonb_set(
-        COALESCE(system_config.value, '{}'::jsonb),
-        '{max_concurrent_subagents}',
-        '5'::jsonb,
-        true
-    ),
-    updated_at = NOW()
-WHERE system_config.value IS NULL
-   OR NOT (system_config.value ? 'max_concurrent_subagents')
-   OR system_config.value -> 'max_concurrent_subagents' IN ('2'::jsonb, 'null'::jsonb);
-
--- 验证：
--- SELECT key, value -> 'max_concurrent_subagents', value -> 'max_output_tokens'
--- FROM system_config WHERE key = 'agent_runtime';
--- ===== END SOURCE 073_subagent_concurrency_default_five.sql =====
 
 -- ===== BEGIN SOURCE 074_local_password_policy.sql =====
 -- 本地账号密码与闲置生命周期。发布代码前执行；不修改任何现有密码哈希。
@@ -121,20 +91,14 @@ BEGIN
     THEN
         RAISE EXCEPTION '072 终态校验失败：诊断索引缺失';
     END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM public.system_config WHERE key = 'agent_runtime'
-          AND jsonb_typeof(value->'max_concurrent_subagents') = 'number'
-          AND value->'max_concurrent_subagents' <> '2'::jsonb
-    ) THEN
-        RAISE EXCEPTION '073 终态校验失败：并发配置缺失或旧默认值未更新';
-    END IF;
 END
 $$;
 
 COMMIT;
 
 -- 提交后只返回结构摘要，不输出账号数据、密码哈希或连接凭据。
-SELECT 'ok' AS status, current_database() AS database_name, '074' AS migration_target;
+SELECT 'ok' AS status, current_database() AS database_name,
+       '074' AS migration_target, '072,074' AS included_migrations;
 SELECT column_name, data_type, is_nullable, column_default
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'users'
