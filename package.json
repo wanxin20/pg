@@ -1,0 +1,11 @@
+{
+  "name": "gos-pg-upgrades",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:sso-only": "node --test tests/sso-only-upgrade.test.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.12"
+  }
+}
